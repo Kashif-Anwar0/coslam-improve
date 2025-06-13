@@ -36,6 +36,7 @@ class CoSLAM():
         self.get_pose_representation()
         self.keyframeDatabase = self.create_kf_database(config)
         self.model = JointEncoding(config, self.bounding_box).to(self.device)
+        self.prev_entropy = 0.0
     
     def seed_everything(self, seed):
         random.seed(seed)
@@ -123,13 +124,56 @@ class CoSLAM():
         self.est_c2w_data_rel = dict['pose_rel']
 
     def select_samples(self, H, W, samples):
-        '''
-        randomly select samples from the image
-        '''
-        #indice = torch.randint(H*W, (samples,))
+        '''Randomly select samples from the image.'''
         indice = random.sample(range(H * W), int(samples))
-        indice = torch.tensor(indice)
-        return indice
+        return torch.tensor(indice)
+
+    def select_samples_weighted(self, H, W, samples, weights=None):
+        """Select samples according to an uncertainty weight map."""
+        if weights is None:
+            return self.select_samples(H, W, samples)
+        weights = weights.view(-1)
+        weights = weights / (weights.sum() + 1e-8)
+        return torch.multinomial(weights, int(samples), replacement=False)
+
+    @torch.no_grad()
+    def compute_uncertainty_map(self, batch, c2w):
+        """Render the current frame to estimate per-pixel depth variance."""
+        rays_d_cam = batch['direction'].reshape(-1, 3).to(self.device)
+        n = rays_d_cam.shape[0]
+        H, W = self.dataset.H, self.dataset.W
+        rays_o = c2w[None, :3, -1].repeat(n, 1)
+        rays_d = torch.sum(rays_d_cam[..., None, :] * c2w[:3, :3], -1)
+        step = 4096
+        vars = []
+        for s in range(0, n, step):
+            ro = rays_o[s:s+step]
+            rd = rays_d[s:s+step]
+            ret = self.model.render_rays(ro, rd)
+            vars.append(ret['depth_var'].detach())
+        var_map = torch.cat(vars, dim=0)
+        return var_map.view(H, W)
+
+    def compute_pose_entropy(self, poses):
+        """Compute an entropy-like metric of pose distribution."""
+        pos = poses[:, :3, 3]
+        cov = torch.from_numpy(np.cov(pos.cpu().numpy().T)).to(pos)
+        cov += torch.eye(3, device=pos.device) * 1e-6
+        return 0.5 * torch.logdet(2 * np.pi * np.e * cov)
+
+    def should_add_keyframe(self, frame_id):
+        if not hasattr(self.keyframeDatabase, 'frame_ids') or self.keyframeDatabase.frame_ids is None:
+            self.prev_entropy = self.compute_pose_entropy(torch.stack([self.est_c2w_data[frame_id]]))
+            return True
+
+        poses = torch.stack([self.est_c2w_data[int(fid.item())] for fid in self.keyframeDatabase.frame_ids] + [self.est_c2w_data[frame_id]])
+        new_entropy = self.compute_pose_entropy(poses)
+        info_gain = self.prev_entropy - new_entropy
+        thresh = self.config['mapping'].get('info_thresh', 0.0)
+        if info_gain > thresh:
+            self.prev_entropy = new_entropy
+            return True
+        return False
 
     def get_loss_from_ret(self, ret, rgb=True, sdf=True, depth=True, fs=True, smooth=False):
         '''
@@ -220,10 +264,14 @@ class CoSLAM():
 
         self.model.train()
 
+        weights_map = None
+        if self.config['mapping'].get('use_uncertainty_sampling', False):
+            weights_map = self.compute_uncertainty_map(batch, c2w)
+
         # Training
         for i in range(self.config['mapping']['cur_frame_iters']):
             self.cur_map_optimizer.zero_grad()
-            indice = self.select_samples(self.dataset.H, self.dataset.W, self.config['mapping']['sample'])
+            indice = self.select_samples_weighted(self.dataset.H, self.dataset.W, self.config['mapping']['sample'], weights_map)
             
             indice_h, indice_w = indice % (self.dataset.H), indice // (self.dataset.H)
             rays_d_cam = batch['direction'].squeeze(0)[indice_h, indice_w, :].to(self.device)
@@ -425,6 +473,11 @@ class CoSLAM():
         iW = self.config['tracking']['ignore_edge_W']
         iH = self.config['tracking']['ignore_edge_H']
 
+        weights_map = None
+        if self.config['tracking'].get('use_uncertainty_sampling', False):
+            c2w_tmp = cur_c2w
+            weights_map = self.compute_uncertainty_map(batch, c2w_tmp)[iH:-iH, iW:-iW]
+
         thresh=0
 
         if self.config['tracking']['iter_point'] > 0:
@@ -519,6 +572,10 @@ class CoSLAM():
         iW = self.config['tracking']['ignore_edge_W']
         iH = self.config['tracking']['ignore_edge_H']
 
+        weights_map = None
+        if self.config['tracking'].get('use_uncertainty_sampling', False):
+            weights_map = self.compute_uncertainty_map(batch, cur_c2w)[iH:-iH, iW:-iW]
+
         cur_rot, cur_trans, pose_optimizer = self.get_pose_param_optim(cur_c2w[None,...], mapping=False)
 
         # Start tracking
@@ -528,7 +585,7 @@ class CoSLAM():
 
             # Note here we fix the sampled points for optimisation
             if indice is None:
-                indice = self.select_samples(self.dataset.H-iH*2, self.dataset.W-iW*2, self.config['tracking']['sample'])
+                indice = self.select_samples_weighted(self.dataset.H-iH*2, self.dataset.W-iW*2, self.config['tracking']['sample'], weights_map)
             
                 # Slicing
                 indice_h, indice_w = indice % (self.dataset.H - iH * 2), indice // (self.dataset.H - iH * 2)
@@ -664,9 +721,19 @@ class CoSLAM():
 
                     
                 # Add keyframe
-                if i % self.config['mapping']['keyframe_every'] == 0:
-                    self.keyframeDatabase.add_keyframe(batch, filter_depth=self.config['mapping']['filter_depth'])
-                    print('add keyframe:',i)
+                if self.config['mapping'].get('use_adaptive_keyframe', False):
+                    if self.should_add_keyframe(i):
+                        weights = None
+                        if self.config['mapping'].get('use_uncertainty_sampling', False):
+                            c2w = self.est_c2w_data[i].to(self.device)
+                            var_map = self.compute_uncertainty_map(batch, c2w)
+                            weights = F.softmax(var_map.view(-1), dim=0)
+                        self.keyframeDatabase.add_keyframe(batch, filter_depth=self.config['mapping']['filter_depth'], weights=weights)
+                        print('add keyframe:', i)
+                else:
+                    if i % self.config['mapping']['keyframe_every'] == 0:
+                        self.keyframeDatabase.add_keyframe(batch, filter_depth=self.config['mapping']['filter_depth'])
+                        print('add keyframe:', i)
             
 
                 if i % self.config['mesh']['vis']==0:

@@ -25,6 +25,9 @@ mapping:
   pose_accum_step: 5
   map_wait_step: 0
   filter_depth: False
+  use_uncertainty_sampling: True
+  use_adaptive_keyframe: True
+  info_thresh: 0.05
 
 tracking:
   iter: 10
@@ -38,6 +41,7 @@ tracking:
   wait_iters: 100
   const_speed: True
   best: True
+  use_uncertainty_sampling: True
 
 grid:
   enc: 'HashGrid'

@@ -20,18 +20,20 @@ class KeyFrameDatabase(object):
     def get_length(self):
         return self.__len__()
     
-    def sample_single_keyframe_rays(self, rays, option='random'):
-        '''
-        Sampling strategy for current keyframe rays
-        '''
+    def sample_single_keyframe_rays(self, rays, option='random', weights=None):
+        '''Sampling strategy for keyframe rays.'''
         if option == 'random':
-            idxs = random.sample(range(0, self.H*self.W), self.num_rays_to_save)
+            if weights is not None:
+                weights = weights.view(-1)
+                weights = weights / (weights.sum() + 1e-8)
+                idxs = torch.multinomial(weights, self.num_rays_to_save, replacement=False).tolist()
+            else:
+                idxs = random.sample(range(0, self.H * self.W), self.num_rays_to_save)
         elif option == 'filter_depth':
             valid_depth_mask = (rays[..., -1] > 0.0) & (rays[..., -1] <= self.config["cam"]["depth_trunc"])
-            rays_valid = rays[valid_depth_mask, :]  # [n_valid, 7]
+            rays_valid = rays[valid_depth_mask, :]
             num_valid = len(rays_valid)
             idxs = random.sample(range(0, num_valid), self.num_rays_to_save)
-
         else:
             raise NotImplementedError()
         rays = rays[:, idxs]
@@ -46,7 +48,7 @@ class KeyFrameDatabase(object):
         else:
             self.frame_ids = torch.cat([self.frame_ids, frame_ids], dim=0)
     
-    def add_keyframe(self, batch, filter_depth=False):
+    def add_keyframe(self, batch, filter_depth=False, weights=None):
         '''
         Add keyframe rays to the keyframe database
         '''
@@ -56,7 +58,7 @@ class KeyFrameDatabase(object):
         if filter_depth:
             rays = self.sample_single_keyframe_rays(rays, 'filter_depth')
         else:
-            rays = self.sample_single_keyframe_rays(rays)
+            rays = self.sample_single_keyframe_rays(rays, weights=weights)
         
         if not isinstance(batch['frame_id'], torch.Tensor):
             batch['frame_id'] = torch.tensor([batch['frame_id']])
